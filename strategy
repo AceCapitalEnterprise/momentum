@@ -1,0 +1,282 @@
+data = pd.read_csv('combined_stock_data.csv')
+
+# Combine all data into a single DataFrame
+#data = pd.concat(all_data, ignore_index=True)
+output_csv_path = 'combined_stock_data.csv'
+data.to_csv(output_csv_path, index=False)
+nifty_index_data = pd.read_csv('SP500_daily_data.csv')
+# Momentum Phase 1
+# Constants
+START_DATE = '2022-01-01'
+END_DATE = '2024-12-31'
+ROC = [3,6,9,12]
+ROC_PERCENTAGE = [0.1, 0.2, 0.3, 0.4]
+PORTFOLIO_SIZE = 20
+END_MONTH_STOCKS = 30
+STOP_LOSS_PERCENT = 0.0
+INITIAL_INVESTMENT = 1000000
+#MAX_DRAWDOWN_PERCENT = 0.2
+#x = 0.5
+
+# Load Data
+def load_data(index_file, stocks_file):
+    nifty50_index_data = pd.read_csv(index_file, parse_dates=['Date'])
+    daily_stocks_data = pd.read_csv(stocks_file, parse_dates=['Date'])
+    return nifty50_index_data, daily_stocks_data
+
+# Find the first trading day of the month
+def first_trading_day_of_month(selected_date, daily_stocks_data):
+    selected_date = pd.to_datetime(selected_date)
+    first_day_of_month = pd.Timestamp(selected_date) + pd.offsets.MonthBegin(0)
+    month_data = daily_stocks_data[(daily_stocks_data['Date'] >= first_day_of_month) &
+                                   (daily_stocks_data['Date'] < first_day_of_month + pd.offsets.MonthEnd(0))]
+    return month_data['Date'].min().strftime('%Y-%m-%d') if not month_data.empty else None
+
+# Find the last trading day of the month
+def last_trading_day_of_month(selected_date, daily_stocks_data):
+    selected_date = pd.to_datetime(selected_date)
+    last_day_of_month = pd.Timestamp(selected_date) + pd.offsets.MonthEnd(0)
+    month_data = daily_stocks_data[(daily_stocks_data['Date'] >= last_day_of_month - pd.DateOffset(months=1)) &
+                                   (daily_stocks_data['Date'] <= last_day_of_month)]
+    return month_data['Date'].max().strftime('%Y-%m-%d') if not month_data.empty else None
+
+
+
+def rank_stocks_roc(selected_date, ROC_periods, ROC_percentage, nifty50_index_data, daily_stocks_data):
+    selected_date = pd.to_datetime(selected_date)
+    start_dates = [selected_date - pd.DateOffset(months=roc) for roc in ROC_periods]
+    start_dates = [start_date.replace(day=1) for start_date in start_dates]
+    start_dates = [last_trading_day_of_month(start_date, daily_stocks_data) for start_date in start_dates]
+    
+    daily_data = daily_stocks_data[daily_stocks_data['Date'] == selected_date]
+    nifty_close_data = nifty50_index_data[nifty50_index_data['Date'] == selected_date]
+    
+    if nifty_close_data.empty or nifty_close_data['open'].iloc[0] <= nifty_close_data['SMA_198'].iloc[0]:
+        return []
+    
+    top_roc_symbols = []
+    
+    for symbol, stock_data in daily_data.groupby('Symbol'):
+        roc_values = []
+        for start_date in start_dates:
+            start_price_data = stock_data[stock_data['Date'] == start_date]
+            if len(start_price_data) == 1:
+                start_price = start_price_data['close'].values[0]
+                end_price = stock_data[stock_data['Date'] == selected_date]['close'].values[0]
+                roc = (end_price - start_price) / start_price
+                roc_values.append(roc)
+            else:
+                roc_values.append(0)
+        
+        if stock_data['close'].iloc[-1] > stock_data['SMA_66'].iloc[-1] :
+            combined_roc = sum(roc * weight for roc, weight in zip(roc_values, ROC_percentage))
+            top_roc_symbols.append((symbol, combined_roc))
+    
+    top_roc_symbols.sort(key=lambda x: x[1], reverse=True)
+    return [symbol for symbol, _ in top_roc_symbols[:PORTFOLIO_SIZE]]
+
+
+
+# Rank stocks at the end of the month based on ROC
+def month_end_ranked(selected_date, ROC_periods ,ROC_percentage, END_MONTH_STOCKS, daily_stocks_data):
+    selected_date = pd.to_datetime(selected_date)
+    start_dates = [selected_date - pd.DateOffset(months=roc) for roc in ROC_periods]
+    start_dates = [start_date.replace(day=1) for start_date in start_dates]
+    start_dates = [last_trading_day_of_month(start_date, daily_stocks_data) for start_date in start_dates]
+    end_dates = [selected_date for _ in ROC_periods]
+    end_dates = [last_trading_day_of_month(end_date, daily_stocks_data) for end_date in end_dates]
+    print("END_MONTH_STOCK", selected_date)
+    daily_data = daily_stocks_data[(daily_stocks_data['Date'] >= start_dates[-1]) & (daily_stocks_data['Date'] <= end_dates[-1])]
+
+    top_roc_symbols = []    
+    for symbol, stock_data in daily_data.groupby('Symbol'):
+        roc_values = []
+        for start_date, end_date in zip(start_dates, end_dates):
+            start_price_data = stock_data[stock_data['Date'] == start_date]
+            end_price_data = stock_data[stock_data['Date'] == end_date]
+            if len(start_price_data) == 1 and len(end_price_data) == 1:
+                start_price = start_price_data['close'].values[0]
+                end_price = end_price_data['close'].values[0]
+                roc = (end_price - start_price) / start_price
+                roc_values.append(roc)
+            else:
+                roc_values.append(0)
+
+        if stock_data['close'].iloc[-1] > stock_data['SMA_198'].iloc[-1] :
+            #zscore = stock_data['rolling_z_score'].iloc[-1]
+            combined_roc = sum(roc * weight for roc, weight in zip(roc_values, ROC_percentage))
+            #combined_roc = combined_roc - zscore
+            top_roc_symbols.append((symbol, combined_roc))
+            
+    top_roc_symbols.sort(key=lambda x: x[1], reverse=True)
+    df = pd.DataFrame(top_roc_symbols, columns=['Symbol', 'ROC'])
+    print(df[:30])
+    filtered_symbols = [symbol for symbol, *_ in top_roc_symbols]  
+    return filtered_symbols[:END_MONTH_STOCKS]
+
+# Get buy price
+def get_buy_price(symbol, entry_date, daily_stocks_data):
+    stock_data = daily_stocks_data[(daily_stocks_data['Symbol'] == symbol) & (daily_stocks_data['Date'] == entry_date)]
+    if not stock_data.empty:
+        return stock_data['close'].values[0]
+    return None
+
+# Get sell price
+def get_sell_price(symbol, exit_date, daily_stocks_data):
+    stock_data = daily_stocks_data[(daily_stocks_data['Symbol'] == symbol) & (daily_stocks_data['Date'] == exit_date)]
+    if not stock_data.empty:
+        return stock_data['close'].values[0]
+    return None
+
+# Handle month-end exits
+def month_end_exits(portfolio, report, last_day_of_month, ROC, END_MONTH_STOCKS, daily_stocks_data):
+    top_month_end_stocks = month_end_ranked(last_day_of_month, ROC, ROC_PERCENTAGE, END_MONTH_STOCKS, daily_stocks_data)
+    for stock in list(portfolio.keys()):
+        if portfolio[stock]['Exit Date'] is None:
+            if stock not in top_month_end_stocks:
+                end_month_exit = pd.to_datetime(last_day_of_month) - pd.DateOffset(days=1)
+                while end_month_exit not in daily_stocks_data['Date'].values:
+                    end_month_exit -= pd.DateOffset(days=1)
+                portfolio[stock]['Exit Date'] = end_month_exit.strftime('%Y-%m-%d')
+                del portfolio[stock]
+                report.loc[(report['Symbol'] == stock) & (report['Exit Date'].isnull()), 'Exit Date'] = end_month_exit.strftime('%Y-%m-%d')
+
+
+
+
+# Handle intra-month exits
+def intra_month_exits(portfolio, report, first_day_of_month, last_day_of_month, STOP_LOSS_PERCENT, daily_stocks_data):
+    current_portfolio_symbols = list(portfolio.keys())
+    for stock in current_portfolio_symbols:
+        if portfolio[stock]['Exit Date'] is None:
+            print(first_day_of_month,last_day_of_month)
+            stock_data = daily_stocks_data[(daily_stocks_data['Symbol'] == stock) & 
+                                           (daily_stocks_data['Date'] >= first_day_of_month) & 
+                                           (daily_stocks_data['Date'] <= last_day_of_month)]
+            entry_price = stock_data.iloc[0]['close']
+            intra_month_exit_date = None
+            for _, row in stock_data.iterrows():
+                if row['close'] < row['SMA_198'] or (STOP_LOSS_PERCENT > 0 and (entry_price - row['close']) / entry_price >= STOP_LOSS_PERCENT):
+                    intra_month_exit_date = row['Date'].strftime('%Y-%m-%d') 
+                    break  
+
+            if intra_month_exit_date:
+                if portfolio[stock]['Exit Date'] is None:
+                    portfolio[stock]['Exit Date'] = intra_month_exit_date
+                    del portfolio[stock]
+                    report.loc[(report['Symbol'] == stock) & (report['Exit Date'].isnull()), 'Exit Date'] = intra_month_exit_date  
+
+
+def execute_momentum_strategy(start_date, end_date, ROC, PORTFOLIO_SIZE, INITIAL_INVESTMENT, nifty50_index_data, daily_stocks_data):
+    portfolio = {}
+    report = pd.DataFrame(columns=['Symbol', 'Entry Date', 'Exit Date', 'Buy Price', 'Sell Price'])
+    current_date = pd.to_datetime(start_date)
+   
+    if not daily_stocks_data[daily_stocks_data['Date'] == end_date].empty:
+        end_date = daily_stocks_data[daily_stocks_data['Date'] == end_date]['Date'].iloc[0].strftime('%Y-%m-%d')
+    else:
+        end_date = daily_stocks_data[daily_stocks_data['Date'] < end_date]['Date'].max().strftime('%Y-%m-%d')
+
+    while current_date <= pd.to_datetime(end_date):
+        first_day_of_month = first_trading_day_of_month(current_date, daily_stocks_data)
+        last_day_of_month = last_trading_day_of_month(current_date, daily_stocks_data)
+
+        if first_day_of_month and last_day_of_month:
+            nifty_condition = weekly_ohlc[weekly_ohlc['Date'] <= first_day_of_month]
+            top_month_start_stocks = rank_stocks_roc(first_day_of_month, ROC, ROC_PERCENTAGE, nifty50_index_data, daily_stocks_data)
+            if not portfolio:
+                for stock in top_month_start_stocks:
+                    if len(portfolio) < PORTFOLIO_SIZE and stock not in portfolio and not (nifty_condition['Close'][-1] < nifty_condition['SMA_12'][-1]).all():
+                        portfolio[stock] = {'Entry Date': first_day_of_month, 'Exit Date': None}
+                        new_entries = pd.DataFrame([{'Symbol': stock, 'Entry Date': first_day_of_month}])
+                        report = pd.concat([report, new_entries], ignore_index=True)
+            else:
+                num_new_stocks = PORTFOLIO_SIZE - len(portfolio)
+                new_stocks = [stock for stock in top_month_start_stocks if stock not in portfolio]
+                for stock in new_stocks[:num_new_stocks]:
+                    if len(portfolio) < PORTFOLIO_SIZE and stock not in portfolio and not (nifty_condition['Close'][-1] < nifty_condition['SMA_12'][-1]).all():
+                        portfolio[stock] = {'Entry Date': first_day_of_month, 'Exit Date': None}
+                        new_entries = pd.DataFrame([{'Symbol': stock, 'Entry Date': first_day_of_month}])
+                        report = pd.concat([report, new_entries], ignore_index=True)
+
+            intra_month_exits(portfolio, report, first_day_of_month, last_day_of_month, STOP_LOSS_PERCENT, daily_stocks_data)
+            #month_end_exits(portfolio, report, last_day_of_month, ROC, END_MONTH_STOCKS, daily_stocks_data)    
+
+        current_date = current_date + pd.DateOffset(months=1)
+
+    for stock in portfolio:
+        if report.loc[report['Symbol'] == stock, 'Exit Date'].isnull().all():
+            report.loc[report['Symbol'] == stock, 'Exit Date'] = end_date
+
+    remaining_stocks = report[report['Exit Date'].isnull()]
+    if not remaining_stocks.empty:
+        remaining_stocks['Exit Date'] = end_date
+        report.update(remaining_stocks)
+
+    report['Buy Price'] = report.apply(lambda row: get_buy_price(row['Symbol'], row['Entry Date'], daily_stocks_data), axis=1)
+    report['Sell Price'] = report.apply(lambda row: get_sell_price(row['Symbol'], row['Exit Date'], daily_stocks_data), axis=1)
+
+    investment_per_stock = INITIAL_INVESTMENT / PORTFOLIO_SIZE
+    report['Exit Date'] = pd.to_datetime(report['Exit Date'])
+    capital_adjustments = {}
+
+    for index, row in report.iterrows():
+        if index < PORTFOLIO_SIZE:
+            report.loc[index, 'Shares'] = np.floor(investment_per_stock / row['Buy Price'])
+            report.loc[index, 'Profit/Loss'] = round((row['Sell Price'] - row['Buy Price']) * report.loc[index, 'Shares'], 2)
+            report.loc[index, '%Change'] = round(((row['Sell Price'] - row['Buy Price']) / row['Buy Price']) * 100, 2)
+            report.loc[index, 'Buy Value'] = round(row['Buy Price'] * report.loc[index, 'Shares'], 2)
+            report.loc[index, 'Sell Value'] = round(row['Sell Price'] * report.loc[index, 'Shares'], 2)
+
+        if index >= PORTFOLIO_SIZE:
+            entry_date = pd.to_datetime(row['Entry Date'])
+            previous_month_start = entry_date - pd.DateOffset(months=1) - pd.offsets.MonthBegin(1)
+            previous_month_end = entry_date - pd.offsets.MonthEnd(1)
+            previous_month_exits = report[(report['Exit Date'] >= previous_month_start) & (report['Exit Date'] <= previous_month_end)]
+            start_date = pd.to_datetime(start_date)
+            while previous_month_exits.empty:
+                previous_month_start -= pd.DateOffset(months=1)
+                previous_month_end -= pd.DateOffset(months=1)
+                previous_month_exits = report[(report['Exit Date'] >= previous_month_start) & (report['Exit Date'] <= previous_month_end)]
+                if previous_month_start.year < entry_date.year:
+                    break     
+                    
+            capital_adjustments[entry_date] = {
+                'num_exits': len(previous_month_exits),
+                'capital_adjustment': previous_month_exits['Profit/Loss'].sum() + len(previous_month_exits) * investment_per_stock
+            }
+            entry_date = pd.to_datetime(row['Entry Date'])
+            num_exits = capital_adjustments[entry_date]['num_exits']
+            #print(capital_adjustments)
+            capital_adjustment = capital_adjustments[entry_date]['capital_adjustment'] / num_exits
+            report.loc[index, 'Shares'] = np.floor(capital_adjustment / row['Buy Price'])
+            report.loc[index, 'Profit/Loss'] = round((row['Sell Price'] - row['Buy Price']) * report.loc[index, 'Shares'], 2)
+            report.loc[index, '%Change'] = round(((row['Sell Price'] - row['Buy Price']) / row['Buy Price']) * 100, 2)
+            report.loc[index, 'Buy Value'] = round(row['Buy Price'] * report.loc[index, 'Shares'], 2)
+            report.loc[index, 'Sell Value'] = round(row['Sell Price'] * report.loc[index, 'Shares'], 2)
+    return report
+
+def main():
+    nifty50_index_data, daily_stocks_data = load_data('SP500_daily_data.csv', 'combined_stock_data.csv')
+    report = execute_momentum_strategy(START_DATE, END_DATE, ROC, PORTFOLIO_SIZE, INITIAL_INVESTMENT, nifty50_index_data, daily_stocks_data)
+    print(report)
+    report.to_csv('Momentum.csv', index=False)
+    print("Completed!")
+
+if __name__ == '__main__':
+    main()
+
+
+
+df = pd.read_csv('Momentum.csv')
+column_sum = df['Profit/Loss'].sum()
+print(column_sum)
+total_return = column_sum/10000
+print('Return % is:', total_return)
+
+START_DATE = datetime.strptime(START_DATE, '%Y-%m-%d')
+END_DATE = datetime.strptime(END_DATE, '%Y-%m-%d')
+years = (END_DATE - START_DATE).days / 365.25
+annual_return = (1 + total_return / 100) ** (1 / years) - 1
+annual_return_percentage = annual_return * 100
+print('Annual return is:', annual_return_percentage)
